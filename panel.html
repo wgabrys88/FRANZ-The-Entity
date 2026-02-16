@@ -1,0 +1,943 @@
+<!--
+panel.html -- Live dashboard for the FRANZ pipeline monitor.
+
+Served by panel.py on port 8080. Connects to /events via Server-Sent
+Events to receive real-time turn data as JSON.
+
+Four-quadrant layout optimized for 16:9 displays:
+  Top-left:     SST (agent memory from previous turn)
+  Top-right:    Feedback (execution results injected into context)
+  Bottom-left:  VLM Response (model output, becomes next SST)
+  Bottom-right: Screenshot (16:9 pipeline image)
+
+Quadrant separators are draggable. All past turns are expanded by
+default. No external dependencies.
+-->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>FRANZ Panel</title>
+<style>
+    :root {
+        --bg: #0a0a0f;
+        --bg-card: #12121a;
+        --bg-card-hover: #1a1a25;
+        --border: #2a2a3a;
+        --text: #d0d0e0;
+        --text-dim: #707088;
+        --text-bright: #f0f0ff;
+        --accent: #4a9eff;
+        --accent-dim: #2a5a9a;
+        --green: #40c040;
+        --red: #e04040;
+        --orange: #e0a020;
+        --purple: #c080ff;
+        --mono: 'Consolas', 'Courier New', 'Liberation Mono', monospace;
+        --header-h: 38px;
+        --controls-h: 34px;
+        --sep-size: 6px;
+        --split-x: 50%;
+        --split-y: 50%;
+    }
+
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+
+    body {
+        background: var(--bg);
+        color: var(--text);
+        font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+        font-size: 14px;
+        line-height: 1.5;
+        overflow: hidden;
+        height: 100vh;
+        width: 100vw;
+    }
+
+    .header {
+        height: var(--header-h);
+        background: var(--bg);
+        border-bottom: 1px solid var(--border);
+        padding: 0 16px;
+        display: flex;
+        align-items: center;
+        gap: 16px;
+        flex-shrink: 0;
+    }
+
+    .header h1 {
+        font-size: 15px;
+        font-weight: 700;
+        color: var(--accent);
+        letter-spacing: 2px;
+    }
+
+    .header .status {
+        display: flex;
+        align-items: center;
+        gap: 5px;
+        font-size: 11px;
+        color: var(--text-dim);
+    }
+
+    .header .status .dot {
+        width: 7px;
+        height: 7px;
+        border-radius: 50%;
+        background: var(--red);
+        transition: background 0.3s;
+    }
+
+    .header .status .dot.connected {
+        background: var(--green);
+        box-shadow: 0 0 5px var(--green);
+    }
+
+    .header .stats {
+        margin-left: auto;
+        display: flex;
+        gap: 14px;
+        font-size: 11px;
+        color: var(--text-dim);
+        font-family: var(--mono);
+    }
+
+    .header .stats span { color: var(--text); }
+
+    .controls {
+        height: var(--controls-h);
+        padding: 0 16px;
+        border-bottom: 1px solid var(--border);
+        display: flex;
+        gap: 12px;
+        align-items: center;
+        font-size: 11px;
+        flex-shrink: 0;
+    }
+
+    .controls label {
+        display: flex;
+        align-items: center;
+        gap: 4px;
+        color: var(--text-dim);
+        cursor: pointer;
+        user-select: none;
+    }
+
+    .controls input[type="checkbox"] { accent-color: var(--accent); }
+
+    .controls button {
+        background: var(--bg-card);
+        border: 1px solid var(--border);
+        color: var(--text);
+        padding: 3px 10px;
+        border-radius: 4px;
+        cursor: pointer;
+        font-size: 11px;
+    }
+
+    .controls button:hover {
+        background: var(--bg-card-hover);
+        border-color: var(--accent-dim);
+    }
+
+    .controls .turn-nav {
+        margin-left: auto;
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        font-family: var(--mono);
+        color: var(--text-dim);
+    }
+
+    .controls .turn-nav button {
+        min-width: 28px;
+        text-align: center;
+    }
+
+    .controls .turn-nav .turn-indicator {
+        min-width: 80px;
+        text-align: center;
+        color: var(--text);
+    }
+
+    .main-area {
+        position: relative;
+        width: 100%;
+        height: calc(100vh - var(--header-h) - var(--controls-h));
+        overflow: hidden;
+    }
+
+    .quadrant {
+        position: absolute;
+        overflow: hidden;
+        display: flex;
+        flex-direction: column;
+    }
+
+    .q-header {
+        height: 24px;
+        min-height: 24px;
+        padding: 0 10px;
+        display: flex;
+        align-items: center;
+        font-size: 10px;
+        font-weight: 600;
+        text-transform: uppercase;
+        letter-spacing: 1px;
+        border-bottom: 1px solid var(--border);
+        flex-shrink: 0;
+        user-select: none;
+    }
+
+    .q-content {
+        flex: 1;
+        overflow-y: auto;
+        overflow-x: hidden;
+        padding: 8px 10px;
+        font-family: var(--mono);
+        font-size: 12px;
+        line-height: 1.6;
+        white-space: pre-wrap;
+        word-break: break-word;
+    }
+
+    .q-content.empty-content {
+        color: var(--text-dim);
+        font-style: italic;
+    }
+
+    #qTL {
+        top: 0;
+        left: 0;
+        border-right: 1px solid var(--border);
+        border-bottom: 1px solid var(--border);
+    }
+
+    #qTR {
+        top: 0;
+        border-bottom: 1px solid var(--border);
+    }
+
+    #qBL {
+        left: 0;
+        border-right: 1px solid var(--border);
+    }
+
+    #qBR {}
+
+    #qTL .q-header { color: var(--accent); background: rgba(74,158,255,0.06); }
+    #qTR .q-header { color: var(--orange); background: rgba(224,160,32,0.06); }
+    #qBL .q-header { color: var(--green); background: rgba(64,192,64,0.06); }
+    #qBR .q-header { color: var(--purple); background: rgba(192,128,255,0.06); }
+
+    .sep {
+        position: absolute;
+        z-index: 50;
+    }
+
+    .sep-h {
+        left: 0;
+        width: 100%;
+        height: var(--sep-size);
+        cursor: row-resize;
+    }
+
+    .sep-v {
+        top: 0;
+        height: 100%;
+        width: var(--sep-size);
+        cursor: col-resize;
+    }
+
+    .sep:hover, .sep.active {
+        background: rgba(74,158,255,0.25);
+    }
+
+    #qBR .q-content {
+        padding: 4px;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        overflow: hidden;
+    }
+
+    #qBR .q-content img {
+        max-width: 100%;
+        max-height: 100%;
+        object-fit: contain;
+        border-radius: 3px;
+        cursor: pointer;
+        display: block;
+    }
+
+    #qBR .q-content img:hover { opacity: 0.85; }
+
+    #qBR .q-content .img-meta {
+        margin-top: 4px;
+        font-size: 10px;
+        color: var(--text-dim);
+        text-align: center;
+        white-space: nowrap;
+    }
+
+    .meta-section {
+        margin-top: 10px;
+        padding-top: 8px;
+        border-top: 1px solid var(--border);
+    }
+
+    .meta-section .meta-title {
+        font-size: 10px;
+        font-weight: 600;
+        color: var(--text-dim);
+        text-transform: uppercase;
+        letter-spacing: 1px;
+        margin-bottom: 4px;
+    }
+
+    .meta-grid {
+        display: grid;
+        grid-template-columns: repeat(2, 1fr);
+        gap: 2px 12px;
+        font-size: 11px;
+    }
+
+    .meta-grid .key { color: var(--text-dim); }
+    .meta-grid .val { color: var(--text); }
+
+    .sst-badge {
+        padding: 1px 6px;
+        border-radius: 3px;
+        font-size: 10px;
+        font-weight: 600;
+        font-family: var(--mono);
+        margin-left: 8px;
+    }
+
+    .sst-badge.ok { background: rgba(64,192,64,0.15); color: var(--green); }
+    .sst-badge.fail { background: rgba(224,64,64,0.15); color: var(--red); }
+    .sst-badge.unknown { background: rgba(224,160,32,0.15); color: var(--orange); }
+
+    .sst-detail {
+        margin-top: 8px;
+        padding: 6px 8px;
+        background: rgba(224,64,64,0.05);
+        border: 1px solid rgba(224,64,64,0.3);
+        border-radius: 3px;
+        font-size: 11px;
+        color: var(--red);
+    }
+
+    .error-block {
+        margin-top: 8px;
+        padding: 6px 8px;
+        background: rgba(224,64,64,0.05);
+        border: 1px solid rgba(224,64,64,0.3);
+        border-radius: 3px;
+        font-size: 11px;
+        color: var(--red);
+    }
+
+    .turn-list-overlay {
+        display: none;
+        position: absolute;
+        top: 0;
+        left: 0;
+        width: 100%;
+        height: 100%;
+        background: var(--bg);
+        z-index: 200;
+        overflow-y: auto;
+        padding: 16px;
+    }
+
+    .turn-list-overlay.visible { display: block; }
+
+    .turn-list-overlay .tl-header {
+        display: flex;
+        align-items: center;
+        gap: 12px;
+        margin-bottom: 12px;
+    }
+
+    .turn-list-overlay .tl-header h2 {
+        font-size: 16px;
+        color: var(--accent);
+    }
+
+    .turn-list-overlay .tl-header button {
+        margin-left: auto;
+        background: var(--bg-card);
+        border: 1px solid var(--border);
+        color: var(--text);
+        padding: 4px 12px;
+        border-radius: 4px;
+        cursor: pointer;
+        font-size: 12px;
+    }
+
+    .turn-card-mini {
+        background: var(--bg-card);
+        border: 1px solid var(--border);
+        border-radius: 6px;
+        margin-bottom: 8px;
+        overflow: hidden;
+    }
+
+    .turn-card-mini.sst-violation {
+        border-color: var(--red);
+    }
+
+    .turn-card-mini .tc-header {
+        padding: 6px 12px;
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        font-size: 12px;
+        font-family: var(--mono);
+        cursor: pointer;
+        user-select: none;
+    }
+
+    .turn-card-mini .tc-header:hover { background: var(--bg-card-hover); }
+
+    .turn-card-mini .tc-header .tc-num {
+        font-weight: 700;
+        color: var(--accent);
+        min-width: 50px;
+    }
+
+    .turn-card-mini .tc-header .tc-meta {
+        color: var(--text-dim);
+        font-size: 11px;
+    }
+
+    .turn-card-mini .tc-header .tc-expand {
+        margin-left: auto;
+        color: var(--text-dim);
+        transition: transform 0.15s;
+    }
+
+    .turn-card-mini.expanded .tc-expand { transform: rotate(90deg); }
+
+    .turn-card-mini .tc-body {
+        display: none;
+        padding: 8px 12px;
+        border-top: 1px solid var(--border);
+    }
+
+    .turn-card-mini.expanded .tc-body { display: block; }
+
+    .tc-body .tc-section {
+        margin-bottom: 8px;
+    }
+
+    .tc-body .tc-section-title {
+        font-size: 10px;
+        font-weight: 600;
+        text-transform: uppercase;
+        letter-spacing: 1px;
+        margin-bottom: 3px;
+    }
+
+    .tc-body .tc-section-title.sst { color: var(--accent); }
+    .tc-body .tc-section-title.feedback { color: var(--orange); }
+    .tc-body .tc-section-title.vlm { color: var(--green); }
+    .tc-body .tc-section-title.screenshot { color: var(--purple); }
+
+    .tc-body .tc-text {
+        background: #08080e;
+        border: 1px solid var(--border);
+        border-radius: 3px;
+        padding: 6px 8px;
+        font-family: var(--mono);
+        font-size: 11px;
+        line-height: 1.5;
+        white-space: pre-wrap;
+        word-break: break-word;
+        color: var(--text);
+    }
+
+    .tc-body .tc-text.empty {
+        color: var(--text-dim);
+        font-style: italic;
+    }
+
+    .tc-body .tc-img-row {
+        text-align: center;
+    }
+
+    .tc-body .tc-img-row img {
+        max-width: 100%;
+        max-height: 300px;
+        border-radius: 3px;
+        cursor: pointer;
+    }
+
+    .empty-state {
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        height: 100%;
+        flex-direction: column;
+        color: var(--text-dim);
+    }
+
+    .empty-state h2 { font-size: 18px; margin-bottom: 6px; color: var(--text); }
+    .empty-state p { font-size: 12px; }
+
+    ::-webkit-scrollbar { width: 5px; height: 5px; }
+    ::-webkit-scrollbar-track { background: transparent; }
+    ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+    ::-webkit-scrollbar-thumb:hover { background: var(--text-dim); }
+</style>
+</head>
+<body>
+
+<div class="header">
+    <h1>FRANZ PANEL</h1>
+    <div class="status">
+        <div class="dot" id="connDot"></div>
+        <span id="connText">Disconnected</span>
+    </div>
+    <div class="stats">
+        Turns: <span id="statTurns">0</span> &nbsp;|&nbsp;
+        Avg latency: <span id="statLatency">--</span> &nbsp;|&nbsp;
+        SST violations: <span id="statViolations">0</span>
+    </div>
+</div>
+
+<div class="controls">
+    <label>
+        <input type="checkbox" id="chkAutoScroll" checked>
+        Auto-advance
+    </label>
+    <label>
+        <input type="checkbox" id="chkNewestFirst" checked>
+        Newest first in history
+    </label>
+    <button id="btnHistory">History</button>
+    <button id="btnClear">Clear</button>
+    <div class="turn-nav">
+        <button id="btnFirst" title="First turn">&lt;&lt;</button>
+        <button id="btnPrev" title="Previous turn">&lt;</button>
+        <span class="turn-indicator" id="turnIndicator">-- / --</span>
+        <button id="btnNext" title="Next turn">&gt;</button>
+        <button id="btnLast" title="Latest turn">&gt;&gt;</button>
+    </div>
+</div>
+
+<div class="main-area" id="mainArea">
+    <div class="quadrant" id="qTL">
+        <div class="q-header">SST -- Agent Memory (previous output)</div>
+        <div class="q-content empty-content" id="qTLContent">(waiting for first turn)</div>
+    </div>
+    <div class="quadrant" id="qTR">
+        <div class="q-header">Feedback -- Execution Result</div>
+        <div class="q-content empty-content" id="qTRContent">(waiting for first turn)</div>
+    </div>
+    <div class="quadrant" id="qBL">
+        <div class="q-header">VLM Response -- becomes next SST</div>
+        <div class="q-content empty-content" id="qBLContent">(waiting for first turn)</div>
+    </div>
+    <div class="quadrant" id="qBR">
+        <div class="q-header">Screenshot -- Pipeline Image</div>
+        <div class="q-content empty-content" id="qBRContent">(waiting for first turn)</div>
+    </div>
+    <div class="sep sep-h" id="sepH"></div>
+    <div class="sep sep-v" id="sepV"></div>
+
+    <div class="turn-list-overlay" id="historyOverlay">
+        <div class="tl-header">
+            <h2>Turn History</h2>
+            <button id="btnCloseHistory">Close</button>
+        </div>
+        <div id="historyList"></div>
+    </div>
+</div>
+
+<script>
+(function() {
+    "use strict";
+
+    var turns = [];
+    var currentIndex = -1;
+    var totalLatency = 0;
+    var violationCount = 0;
+    var eventSource = null;
+    var splitX = 0.50;
+    var splitY = 0.50;
+
+    var connDot = document.getElementById("connDot");
+    var connText = document.getElementById("connText");
+    var statTurns = document.getElementById("statTurns");
+    var statLatency = document.getElementById("statLatency");
+    var statViolations = document.getElementById("statViolations");
+    var mainArea = document.getElementById("mainArea");
+    var qTL = document.getElementById("qTL");
+    var qTR = document.getElementById("qTR");
+    var qBL = document.getElementById("qBL");
+    var qBR = document.getElementById("qBR");
+    var qTLContent = document.getElementById("qTLContent");
+    var qTRContent = document.getElementById("qTRContent");
+    var qBLContent = document.getElementById("qBLContent");
+    var qBRContent = document.getElementById("qBRContent");
+    var sepH = document.getElementById("sepH");
+    var sepV = document.getElementById("sepV");
+    var chkAutoScroll = document.getElementById("chkAutoScroll");
+    var chkNewestFirst = document.getElementById("chkNewestFirst");
+    var btnHistory = document.getElementById("btnHistory");
+    var btnClear = document.getElementById("btnClear");
+    var btnFirst = document.getElementById("btnFirst");
+    var btnPrev = document.getElementById("btnPrev");
+    var btnNext = document.getElementById("btnNext");
+    var btnLast = document.getElementById("btnLast");
+    var turnIndicator = document.getElementById("turnIndicator");
+    var historyOverlay = document.getElementById("historyOverlay");
+    var historyList = document.getElementById("historyList");
+    var btnCloseHistory = document.getElementById("btnCloseHistory");
+
+    function esc(s) {
+        if (!s) return "";
+        return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+    }
+
+    function layoutQuadrants() {
+        var w = mainArea.offsetWidth;
+        var h = mainArea.offsetHeight;
+        var sx = Math.max(0.15, Math.min(0.85, splitX));
+        var sy = Math.max(0.15, Math.min(0.85, splitY));
+        var sepHalf = 3;
+        var lw = Math.round(w * sx) - sepHalf;
+        var rw = w - lw - sepHalf * 2;
+        var th = Math.round(h * sy) - sepHalf;
+        var bh = h - th - sepHalf * 2;
+
+        qTL.style.left = "0px";
+        qTL.style.top = "0px";
+        qTL.style.width = lw + "px";
+        qTL.style.height = th + "px";
+
+        qTR.style.left = (lw + sepHalf * 2) + "px";
+        qTR.style.top = "0px";
+        qTR.style.width = rw + "px";
+        qTR.style.height = th + "px";
+
+        qBL.style.left = "0px";
+        qBL.style.top = (th + sepHalf * 2) + "px";
+        qBL.style.width = lw + "px";
+        qBL.style.height = bh + "px";
+
+        qBR.style.left = (lw + sepHalf * 2) + "px";
+        qBR.style.top = (th + sepHalf * 2) + "px";
+        qBR.style.width = rw + "px";
+        qBR.style.height = bh + "px";
+
+        sepH.style.top = (th - sepHalf) + "px";
+        sepH.style.left = "0px";
+        sepH.style.width = w + "px";
+        sepH.style.height = (sepHalf * 2) + "px";
+
+        sepV.style.left = (lw - sepHalf) + "px";
+        sepV.style.top = "0px";
+        sepV.style.width = (sepHalf * 2) + "px";
+        sepV.style.height = h + "px";
+    }
+
+    function initSepDrag(sepEl, axis) {
+        var dragging = false;
+        sepEl.addEventListener("mousedown", function(e) {
+            e.preventDefault();
+            dragging = true;
+            sepEl.classList.add("active");
+            document.body.style.cursor = axis === "x" ? "col-resize" : "row-resize";
+            document.body.style.userSelect = "none";
+        });
+        document.addEventListener("mousemove", function(e) {
+            if (!dragging) return;
+            var rect = mainArea.getBoundingClientRect();
+            if (axis === "x") {
+                splitX = (e.clientX - rect.left) / rect.width;
+            } else {
+                splitY = (e.clientY - rect.top) / rect.height;
+            }
+            layoutQuadrants();
+        });
+        document.addEventListener("mouseup", function() {
+            if (dragging) {
+                dragging = false;
+                sepEl.classList.remove("active");
+                document.body.style.cursor = "";
+                document.body.style.userSelect = "";
+            }
+        });
+    }
+
+    initSepDrag(sepV, "x");
+    initSepDrag(sepH, "y");
+    window.addEventListener("resize", layoutQuadrants);
+    layoutQuadrants();
+
+    function updateStats() {
+        statTurns.textContent = turns.length;
+        if (turns.length > 0) {
+            statLatency.textContent = Math.round(totalLatency / turns.length) + "ms";
+        }
+        statViolations.textContent = violationCount;
+        if (violationCount > 0) {
+            statViolations.style.color = "#e04040";
+        }
+    }
+
+    function updateIndicator() {
+        if (turns.length === 0) {
+            turnIndicator.textContent = "-- / --";
+        } else {
+            var t = turns[currentIndex];
+            turnIndicator.textContent = "Turn " + (t.turn || currentIndex + 1) + " / " + turns.length;
+        }
+    }
+
+    function displayTurn(idx) {
+        if (idx < 0 || idx >= turns.length) return;
+        currentIndex = idx;
+        var entry = turns[idx];
+        var req = entry.request || {};
+        var resp = entry.response || {};
+        var sst = entry.sst_check || {};
+        var sampling = req.sampling || {};
+        var usage = resp.usage || {};
+
+        var sstText = req.sst_text || "";
+        var isViolation = sst.verified && !sst.match;
+        var sstClass = !sst.verified ? "unknown" : (sst.match ? "ok" : "fail");
+        var sstLabel = !sst.verified ? "?" : (sst.match ? "OK" : "VIOLATION");
+
+        var sstHtml = "";
+        if (sstText) {
+            sstHtml = esc(sstText);
+        } else {
+            sstHtml = '<span style="color:var(--text-dim);font-style:italic">(empty)</span>';
+        }
+        sstHtml += '\n\n<span class="sst-badge ' + sstClass + '">SST: ' + sstLabel + '</span>';
+        if (isViolation && sst.detail) {
+            sstHtml += '\n<div class="sst-detail">' + esc(sst.detail) + '</div>';
+        }
+        sstHtml += '\n\n<div class="meta-section"><div class="meta-title">Metadata</div><div class="meta-grid">';
+        sstHtml += '<div><span class="key">model:</span> <span class="val">' + esc(req.model) + '</span></div>';
+        sstHtml += '<div><span class="key">temperature:</span> <span class="val">' + (sampling.temperature != null ? sampling.temperature : "?") + '</span></div>';
+        sstHtml += '<div><span class="key">top_p:</span> <span class="val">' + (sampling.top_p != null ? sampling.top_p : "?") + '</span></div>';
+        sstHtml += '<div><span class="key">max_tokens:</span> <span class="val">' + (sampling.max_tokens != null ? sampling.max_tokens : "?") + '</span></div>';
+        sstHtml += '<div><span class="key">latency:</span> <span class="val">' + Math.round(entry.latency_ms || 0) + 'ms</span></div>';
+        sstHtml += '<div><span class="key">status:</span> <span class="val">' + (resp.status || "?") + '</span></div>';
+        sstHtml += '<div><span class="key">req_size:</span> <span class="val">' + (req.body_size_bytes || "?") + ' B</span></div>';
+        sstHtml += '<div><span class="key">resp_size:</span> <span class="val">' + (resp.body_size_bytes || "?") + ' B</span></div>';
+        sstHtml += '<div><span class="key">prompt_tok:</span> <span class="val">' + (usage.prompt_tokens != null ? usage.prompt_tokens : "?") + '</span></div>';
+        sstHtml += '<div><span class="key">compl_tok:</span> <span class="val">' + (usage.completion_tokens != null ? usage.completion_tokens : "?") + '</span></div>';
+        sstHtml += '<div><span class="key">finish:</span> <span class="val">' + esc(resp.finish_reason || "?") + '</span></div>';
+        sstHtml += '<div><span class="key">timestamp:</span> <span class="val">' + esc(entry.timestamp || "") + '</span></div>';
+        sstHtml += '</div></div>';
+
+        qTLContent.innerHTML = sstHtml;
+        qTLContent.classList.remove("empty-content");
+
+        var fbText = req.feedback_text || "";
+        if (fbText) {
+            qTRContent.textContent = fbText;
+            qTRContent.classList.remove("empty-content");
+        } else {
+            qTRContent.innerHTML = '<span style="color:var(--text-dim);font-style:italic">(empty)</span>';
+            qTRContent.classList.add("empty-content");
+        }
+        if (resp.error) {
+            var errHtml = qTRContent.innerHTML;
+            errHtml += '\n\n<div class="error-block">ERROR: ' + esc(resp.error) + '</div>';
+            qTRContent.innerHTML = errHtml;
+        }
+
+        var vlmText = resp.vlm_text || "";
+        if (vlmText) {
+            qBLContent.textContent = vlmText;
+            qBLContent.classList.remove("empty-content");
+        } else {
+            qBLContent.innerHTML = '<span style="color:var(--text-dim);font-style:italic">(empty)</span>';
+            qBLContent.classList.add("empty-content");
+        }
+
+        var imageDataUri = req.image_data_uri || "";
+        if (req.has_image && imageDataUri) {
+            var b64Start = imageDataUri.indexOf(",");
+            var b64Length = b64Start >= 0 ? imageDataUri.length - b64Start - 1 : imageDataUri.length;
+            var approxKB = Math.round((b64Length * 3 / 4) / 1024);
+            qBRContent.innerHTML =
+                '<img src="' + imageDataUri + '" alt="Turn ' + (entry.turn || "") +
+                '" title="Click to open full size" onclick="window.open(this.src,\'_blank\')">' +
+                '<div class="img-meta">~' + approxKB + ' KB</div>';
+            qBRContent.classList.remove("empty-content");
+        } else {
+            qBRContent.innerHTML = '<span style="color:var(--text-dim);font-style:italic">(no image)</span>';
+            qBRContent.classList.add("empty-content");
+        }
+
+        updateIndicator();
+    }
+
+    function goFirst() { if (turns.length > 0) displayTurn(0); }
+    function goPrev() { if (currentIndex > 0) displayTurn(currentIndex - 1); }
+    function goNext() { if (currentIndex < turns.length - 1) displayTurn(currentIndex + 1); }
+    function goLast() { if (turns.length > 0) displayTurn(turns.length - 1); }
+
+    btnFirst.addEventListener("click", goFirst);
+    btnPrev.addEventListener("click", goPrev);
+    btnNext.addEventListener("click", goNext);
+    btnLast.addEventListener("click", goLast);
+
+    document.addEventListener("keydown", function(e) {
+        if (historyOverlay.classList.contains("visible")) return;
+        if (e.key === "ArrowLeft" || e.key === "a") goPrev();
+        else if (e.key === "ArrowRight" || e.key === "d") goNext();
+        else if (e.key === "Home") goFirst();
+        else if (e.key === "End") goLast();
+    });
+
+    function renderHistoryCard(entry, idx) {
+        var t = entry.turn || 0;
+        var req = entry.request || {};
+        var resp = entry.response || {};
+        var sst = entry.sst_check || {};
+        var isViolation = sst.verified && !sst.match;
+
+        var card = document.createElement("div");
+        card.className = "turn-card-mini expanded" + (isViolation ? " sst-violation" : "");
+
+        var hdr = document.createElement("div");
+        hdr.className = "tc-header";
+        hdr.innerHTML =
+            '<span class="tc-num">Turn ' + t + '</span>' +
+            '<span class="tc-meta">' +
+            Math.round(entry.latency_ms || 0) + 'ms | ' +
+            (resp.vlm_text_length || 0) + ' chars | ' +
+            (resp.finish_reason || "?") +
+            '</span>' +
+            '<span class="tc-expand">&#9654;</span>';
+        hdr.addEventListener("click", function() {
+            card.classList.toggle("expanded");
+        });
+        hdr.addEventListener("dblclick", function() {
+            historyOverlay.classList.remove("visible");
+            displayTurn(idx);
+        });
+
+        var body = document.createElement("div");
+        body.className = "tc-body";
+
+        var sstText = req.sst_text || "";
+        var fbText = req.feedback_text || "";
+        var vlmText = resp.vlm_text || "";
+        var imageDataUri = req.image_data_uri || "";
+
+        body.innerHTML =
+            '<div class="tc-section">' +
+            '<div class="tc-section-title sst">SST (' + (req.sst_text_length || 0) + ' chars)</div>' +
+            '<div class="tc-text' + (sstText ? '' : ' empty') + '">' + (sstText ? esc(sstText) : '(empty)') + '</div>' +
+            '</div>' +
+            '<div class="tc-section">' +
+            '<div class="tc-section-title feedback">Feedback</div>' +
+            '<div class="tc-text' + (fbText ? '' : ' empty') + '">' + (fbText ? esc(fbText) : '(empty)') + '</div>' +
+            '</div>' +
+            '<div class="tc-section">' +
+            '<div class="tc-section-title vlm">VLM Response (' + (resp.vlm_text_length || 0) + ' chars)</div>' +
+            '<div class="tc-text' + (vlmText ? '' : ' empty') + '">' + (vlmText ? esc(vlmText) : '(empty)') + '</div>' +
+            '</div>' +
+            (req.has_image && imageDataUri ?
+                '<div class="tc-section">' +
+                '<div class="tc-section-title screenshot">Screenshot</div>' +
+                '<div class="tc-img-row"><img src="' + imageDataUri +
+                '" alt="Turn ' + t + '" onclick="window.open(this.src,\'_blank\')"></div>' +
+                '</div>'
+                : '') +
+            (resp.error ? '<div class="error-block">ERROR: ' + esc(resp.error) + '</div>' : '');
+
+        card.appendChild(hdr);
+        card.appendChild(body);
+        return card;
+    }
+
+    function showHistory() {
+        historyList.innerHTML = "";
+        var ordered = [];
+        for (var i = 0; i < turns.length; i++) ordered.push(i);
+        if (chkNewestFirst.checked) ordered.reverse();
+        for (var j = 0; j < ordered.length; j++) {
+            historyList.appendChild(renderHistoryCard(turns[ordered[j]], ordered[j]));
+        }
+        historyOverlay.classList.add("visible");
+    }
+
+    btnHistory.addEventListener("click", showHistory);
+    btnCloseHistory.addEventListener("click", function() {
+        historyOverlay.classList.remove("visible");
+    });
+
+    btnClear.addEventListener("click", function() {
+        turns = [];
+        currentIndex = -1;
+        totalLatency = 0;
+        violationCount = 0;
+        updateStats();
+        updateIndicator();
+        qTLContent.innerHTML = '<span style="color:var(--text-dim);font-style:italic">(waiting for first turn)</span>';
+        qTLContent.classList.add("empty-content");
+        qTRContent.innerHTML = '<span style="color:var(--text-dim);font-style:italic">(waiting for first turn)</span>';
+        qTRContent.classList.add("empty-content");
+        qBLContent.innerHTML = '<span style="color:var(--text-dim);font-style:italic">(waiting for first turn)</span>';
+        qBLContent.classList.add("empty-content");
+        qBRContent.innerHTML = '<span style="color:var(--text-dim);font-style:italic">(waiting for first turn)</span>';
+        qBRContent.classList.add("empty-content");
+        historyList.innerHTML = "";
+    });
+
+    function connect() {
+        if (eventSource) eventSource.close();
+        eventSource = new EventSource("/events");
+
+        eventSource.onopen = function() {
+            connDot.classList.add("connected");
+            connText.textContent = "Connected";
+        };
+
+        eventSource.onmessage = function(evt) {
+            try {
+                var data = JSON.parse(evt.data);
+                if (data.type === "connected") return;
+
+                turns.push(data);
+                totalLatency += (data.latency_ms || 0);
+                var sst = data.sst_check || {};
+                if (sst.verified && !sst.match) violationCount++;
+                updateStats();
+
+                if (chkAutoScroll.checked) {
+                    displayTurn(turns.length - 1);
+                } else {
+                    updateIndicator();
+                }
+            } catch(e) {
+                console.warn("SSE parse error:", e, evt.data);
+            }
+        };
+
+        eventSource.onerror = function() {
+            connDot.classList.remove("connected");
+            connText.textContent = "Reconnecting...";
+        };
+    }
+
+    connect();
+})();
+</script>
+</body>
+</html>
